@@ -1,0 +1,318 @@
+#!/bin/bash
+
+# This script keeps your passwords safe
+# They will be encrypted with AES256
+#
+# bash strict mode
+#set -e
+set -u
+set -o pipefail
+IFS=$'\t\n'
+
+PASSWORD_PATH="$HOME"
+PASSWORD_FILE=".passwords"
+
+# seconds the password is kept in clipboard
+CLIPBOARD_SECONDS=20
+
+PASS_FILE=""
+
+OPTIONS="isp:"
+declare -a NON_OPTIONS_ARGUMENTS
+# default options
+OPT_PRINT="n"
+OPT_INTERACTIVE="n"
+OPT_PASSWORD="n"
+
+# relation between numbers starting with 1 and the keys
+# filled by sub_show and used by get
+declare -a NUMBER_KEY
+NUMBER_KEY[0]="nothing"
+
+print_usage()
+{
+	echo ""
+	echo "usage: $0 command [options]"
+	echo ""
+	echo "Possible commands:"
+	echo -e "\tcreate\t\t Create a new password database"
+	echo -e "\tget [-isp]\t Get a password for a key"
+	echo -e "\tshow [-p]\t Show all stored passwords"
+	echo -e "\tstore [-p]\t Store a new password in the database"
+	echo -e "\tconfig [-fP]\t Change name and path to the cyrpted password file"
+	echo -e "\thelp\t\t print this help"
+	echo ""
+	echo "Possible Options:"
+	echo -e "\t-i, \t Interactive mode"
+	echo -e "\t-s, \t Print password on stdin instead of copying to clipboard"
+	echo -e "\t-p, \t Password is next argument"
+	echo -e "\t-P, \t Path to the password file"
+	echo -e "\t-f, \t Filename to the password file"
+	echo ""
+	exit 1
+}
+
+# this function checks if the output is valid
+# output is valid if it is non empty
+check_output()
+{
+	if [[ -z "$1" ]]
+	then
+		echo "Hmm I think I have lost all your passwords.."
+		sleep 2
+		echo "Just kidding...you have misstyped the key"
+		exit 1
+	fi
+}
+
+# this function reads a password from the file
+
+sub_get()
+{
+	# using key given by argument if any
+	if [ ${#NON_OPTIONS_ARGUMENTS[@]} -eq 2 ]
+	then
+		if [ "$OPT_INTERACTIVE" == "y" ]
+		then
+			echo "You have specified interactive mode but given a key by argument. Come on, what do you want?"
+			exit 1
+		fi
+		key=${NON_OPTIONS_ARGUMENTS[1]}
+	else
+		echo "no key given, using interactive mode now"
+		OPT_INTERACTIVE="y"
+	fi
+
+	# if interactive mode ask for key
+	if [ "$OPT_INTERACTIVE" == "y" ] 
+	then
+		# show all keys
+		sub_show $1
+		echo "Please enter key (number or real key):"
+		echo -n "> "
+		read  key
+		# if number get the key to the digit
+		if [[ "$key" =~ ^[0-9]+$ ]]
+		then 
+			key=${NUMBER_KEY[$key]}
+		fi
+	fi
+	# get password
+	OUTPUT=$(echo "$1" | gpg --batch --passphrase-fd 0 --decrypt ${PASSWORD_PATH}/${PASSWORD_FILE}.gpg 2>/dev/null \
+	| sed -ne "s/^$key:\(.*\)$/\1/p")
+
+	check_output "$OUTPUT"
+	
+	# stdin or clipboard?
+	if [ "$OPT_PRINT" == "y" ]
+	then
+		echo "$OUTPUT"
+	else
+		# copy to clipboard
+		echo -n $OUTPUT | xsel -ib
+		echo "Password in clipboard for $CLIPBOARD_SECONDS seconds"
+		# start new process to wait and kill clipboard
+		nohup bash -c "sleep $CLIPBOARD_SECONDS && xsel -b --delete" 1>/dev/null 2>&1 &
+	fi
+}
+
+# This function ask for a new key value combination and safes it 
+# feature: generate password#
+sub_store()
+{
+	PASS=$(echo "$1" | gpg --batch --passphrase-fd 0 --decrypt ${PASSWORD_PATH}/${PASSWORD_FILE}.gpg 2>/dev/null)
+	if [ $? -ne 0 ]
+	then
+		echo "could not read password file. Maybe password wrong?"
+		exit 1
+	fi
+	echo "Enter new key:"
+	read key
+	echo "Enter new password (auto generated if empty):"
+	read -s password
+	echo $password
+	if [[ -z "$password" ]]
+	then
+		password=$(apg -a 1 -n 1 -m15)
+	fi
+	PASS=$(echo "$PASS"; echo "$key:$password")
+	echo "Password for password file. It is possible here to choose a new one"
+	OUTPUT_CRYPTED=$(echo "$PASS" | gpg -c --batch --cipher-algo AES256) 
+	if [ $? -eq 0 ]
+	then
+		echo -n "$OUTPUT_CRYPTED" > ${PASSWORD_PATH}/${PASSWORD_FILE}.gpg
+		echo "password saved"
+	else
+		echo "upps problem"
+	fi
+}
+
+# This function shows all safed keys and stores them in the array NUMBER_KEY
+
+sub_show()
+{
+	local i=1
+	output=$(echo "$1" | gpg --batch --passphrase-fd 0  --decrypt ${PASSWORD_PATH}/${PASSWORD_FILE}.gpg 2>/dev/null \
+	| sed -ne "s/^\(.*\):.*$/\1/p")
+	if [ $? -ne 0 ]
+	then
+		echo "Can't show you keys. Maybe password wrong?"
+		exit 1
+	fi
+
+	for key in $output
+	do
+		echo "$i) $key"
+		NUMBER_KEY=("${NUMBER_KEY[@]}" "$key")
+		i=$(($i+1))
+	done
+}
+
+# create a new password file
+sub_create()
+{
+	echo "" | gpg -c --batch --cipher-algo AES256 > ${PASSWORD_PATH}/${PASSWORD_FILE}.gpg 2>/dev/null
+	if [ $? -eq 0 ]
+	then
+		echo "Create password file: ${PASSWORD_PATH}/${PASSWORD_FILE}.gpg"
+	else
+		echo "Could not create file. Permissions?"
+	fi
+}
+
+sub_config()
+{
+	if [ $OPT_INTERACTIVE == "y" ]
+	then
+		echo "Enter new file name:"
+		read NEW_FILENAME
+		echo "Enter new path:"
+		read NEW_PATH
+	fi
+
+	# if one or both of them are empty use old one
+	if [[ -z $NEW_PATH ]]
+	then
+		NEW_PATH=$PASSWORD_PATH
+		echo "no new path given, use old one"
+	fi
+
+	if [[ -z $NEW_FILENAME ]]
+	then
+		NEW_FILENAME=$PASSWORD_FILE
+		echo "no new filename given, use old one"
+	fi
+	
+	if [[ ! -e $NEW_PATH ]]
+	then
+		echo "path $NEW_PATH does not exist."
+		exit 1
+	fi
+
+	# comment out slashes in the path
+	SED_NEW_PATH=$(echo "$NEW_PATH" | sed 's/\//\\\//g' )
+	SED_CONFIG_TERM="s/^PASSWORD_PATH=.*$/PASSWORD_PATH=\"${SED_NEW_PATH}\"/g; s/^PASSWORD_FILE=.*$/PASSWORD_FILE=\"${NEW_FILENAME}\"/g"
+
+	# config saved in this script so change this script!
+	if [ -w $0 ]
+	then
+		sed -i "$SED_CONFIG_TERM" $0
+	else
+		sudo sed -i "$SED_CONFIG_TERM"  $0
+	fi
+}
+
+process_options()
+{
+	# first option is command
+	if [ "$#" -ge 1 ]
+	then
+		# command specific options
+		NON_OPTIONS_ARGUMENTS[0]=$1
+		case $1 in
+			config)
+				OPTIONS="ip:f:P:"
+				NEW_FILENAME=""
+				NEW_PATH=""
+				;;
+			get)
+				OPTIONS="isp:"
+				;;
+			show)
+				OPTIONS="p:"
+				;;
+			store)
+				OPTIONS="p:"
+				;;
+			create)
+				OPTIONS=""
+				;;
+			help)
+				print_usage
+				;;
+			*)
+				echo "$1 is not a valid command"
+				print_usage
+				;;
+		esac
+
+		shift
+	else
+		echo "No command given"
+		print_usage
+		exit 1
+	fi
+
+	# parse short options
+	# parsing all options for all commands
+	while getopts ":$OPTIONS" GET_OPS
+	do
+		case $GET_OPS in
+			i)
+				OPT_INTERACTIVE="y"
+				;;
+			s)
+				OPT_PRINT="y"
+				;;
+			p)
+				OPT_PASSWORD="y"
+				PASS_FILE=$OPTARG
+				;;
+			f)
+				NEW_FILENAME=$OPTARG
+				;;
+			P)
+				NEW_PATH=$OPTARG
+				;;
+			?)
+				echo "Invalid option: -$OPTARG" 
+				print_usage
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+	#
+	NON_OPTIONS_ARGUMENTS=("${NON_OPTIONS_ARGUMENTS[@]}" "$@")
+}
+
+
+process_options $@
+
+# does the password file exists?
+if [ ! -e ${PASSWORD_PATH}/${PASSWORD_FILE}.gpg ] && [ "${NON_OPTIONS_ARGUMENTS[0]}" != "create" ] && [ "${NON_OPTIONS_ARGUMENTS[0]}" != "config" ]
+
+then
+	echo "password file ${PASSWORD_PATH}/${PASSWORD_FILE}.gpg does not exists"
+	echo "please run create"
+	exit 1
+fi
+
+# ask the password once if not given as argument
+if [ $OPT_PASSWORD == "n" ] && [ "${NON_OPTIONS_ARGUMENTS[0]}" != "config" ] && [ "${NON_OPTIONS_ARGUMENTS[0]}" != "create" ] 
+then
+	echo "Please enter password:"
+	read -s PASS_FILE
+fi
+
+sub_${NON_OPTIONS_ARGUMENTS[0]} $PASS_FILE
+
